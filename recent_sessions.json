@@ -1,0 +1,23 @@
+{
+  "version": "3.0",
+  "last_updated": "2026-01-05T14:07:09.845438",
+  "max_sessions": 10,
+  "sessions": [
+    {
+      "path_absolute": "F:\\Kiran\\new__datasset\\testings\\test_14_1218\\03\\Final_Video_v5_2_20251218_135756\\original_20251218_140643",
+      "path_relative": null,
+      "name": "original_20251218_140643",
+      "last_opened": "2026-01-05T14:07:09.845438",
+      "frame_count": 904,
+      "labeled_frames": 3,
+      "channels": [
+        "High Confidence",
+        "Medium Confidence",
+        "Low Confidence",
+        "Borderline Cases"
+      ],
+      "tif_filename": "original.tif",
+      "created_at": "2025-12-30T13:04:18.930016"
+    }
+  ]
+}
