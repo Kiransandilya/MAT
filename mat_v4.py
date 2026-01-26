@@ -2179,7 +2179,22 @@ class FileManager:
                 log("No annotations to save", 'WARNING')
                 return False
             
+            #Detect if output directory has changed
+            need_new_structure = False
+
             if self.current_project_dir is None:
+                need_new_structure = True
+            else:
+                current_output_dir = self.current_project_dir.parent.resolve()
+                new_output_dir = output_dir.resolve()
+
+                if current_output_dir != new_output_dir:
+                    log(f"Output directory changed: {current_output_dir} → {new_output_dir}")
+                    log("Creating NEW project structure in new location...")
+                    need_new_structure = True
+            
+            # Create new structure or use existing
+            if need_new_structure:
                 base_name = image_handler.metadata.file_path.stem
                 folders = self.create_multichannel_structure(
                     output_dir, base_name, image_handler.metadata.file_path
@@ -2551,13 +2566,74 @@ class OptimizedCanvas(ttk.Frame):
         
         if mode == "ask":
             # Show dialog
-            self._show_contour_fill_dialog()
+            self._show_contour_mode_dialog()
         elif mode == "fill":
             # Apply fill directly
             self._apply_contour_fill_direct()
         elif mode == "outline":
             # Apply outline directly
             self._apply_contour_outline_direct()
+
+    def _show_contour_mode_dialog(self):
+        """Show dialog asking user to choose fill or outline."""
+        dialog = tk.Toplevel(self.app.root)
+        dialog.title("Contour Mode")
+        dialog.geometry("300x150")
+        dialog.transient(self.app.root)
+        dialog.grab_set()
+        
+        # Center dialog
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (dialog.winfo_reqwidth() // 2)
+        y = (dialog.winfo_screenheight() // 2) - (dialog.winfo_reqheight() // 2)
+        dialog.geometry(f"+{x}+{y}")
+        
+        main_frame = ttk.Frame(dialog, padding=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(
+            main_frame,
+            text="How to draw this contour?",
+            font=("Arial", 11, "bold")
+        ).pack(pady=(0, 15))
+        
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill=tk.X, pady=10)
+        
+        def fill_action():
+            dialog.destroy()
+            self._apply_contour_fill_direct()
+        
+        def outline_action():
+            dialog.destroy()
+            self._apply_contour_outline_direct()
+        
+        def cancel_action():
+            self._clear_contour_visual()
+            if hasattr(self, '_undo_mask_before'):
+                delattr(self, '_undo_mask_before')
+            dialog.destroy()
+        
+        ttk.Button(
+            button_frame,
+            text="Fill Contour",
+            command=fill_action,
+            width=15
+        ).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(
+            button_frame,
+            text="Outline Only",
+            command=outline_action,
+            width=15
+        ).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(
+            main_frame,
+            text="Cancel",
+            command=cancel_action,
+            width=10
+        ).pack(pady=(10, 0))
 
 
     def _apply_contour_fill_direct(self):
@@ -4162,9 +4238,10 @@ class MATApplication:
         self.contour_mode_var = None
         
         # Project info
-        self.project_name: str = ""
+        self.project_name: str = None
         self.project_dir: Optional[Path] = None
         self.original_tif_path: Optional[Path] = None
+
         # Setup UI
         self.setup_theme()
         self.setup_ui()
@@ -5357,6 +5434,7 @@ class MATApplication:
         if confirm:
             self.frame_annotations.clear()
             self.undo_stack.clear()
+            self.frame_modified.clear() 
             self.frame_modified.clear()
             
             self.update_display_now()
