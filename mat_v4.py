@@ -129,7 +129,7 @@ class Config:
     CLEANUP_INTERVAL_MS = int(os.getenv('MAT_CLEANUP_INTERVAL', '10000'))
 
     # Playback settings
-    DEFAULT_PLAYBACK_FPS = 10  # Default FPS for playback
+    DEFAULT_PLAYBACK_FPS = 40  # Default FPS for playback
     MIN_PLAYBACK_FPS = 1
     MAX_PLAYBACK_FPS = 60
     
@@ -985,6 +985,7 @@ class PlaybackController:
     - Play/pause with smooth frame transitions
     - Adjustable FPS (1-60)
     - Loop or stop at end
+    - Frame loop mode (continuous or single-cycle)
     - Background frame pre-loading during playback
     """
     
@@ -995,6 +996,21 @@ class PlaybackController:
         self.loop = False
         self.playback_timer = None
         self._stop_flag = False
+
+        #Loop mode state
+        self.loop_active = False
+        self.loop_mode = None  # 'continuous' or 'single'
+        self.loop_home_frame = 0
+        self.loop_min_bound = 0
+        self.loop_max_bound = 0
+        self.loop_direction = 'forward'  # 'forward', 'backward', 'return'
+        self.loop_range = 40  # Default loop range
+        self.loop_cycle_count = 0
+        
+        # Save view state before loop
+        self.saved_zoom = None
+        self.saved_pan_x = None
+        self.saved_pan_y = None
     
     def play(self) -> bool:
         """Start playback."""
@@ -1047,6 +1063,14 @@ class PlaybackController:
             # Restart with new delay
             self._play_next_frame()
             log(f"Playback FPS changed to {self.fps} (restarted)")
+
+        # If looping, restart with new FPS
+        elif self.loop_active and old_fps != self.fps:
+            if self.playback_timer:
+                self.app.root.after_cancel(self.playback_timer)
+                self.playback_timer = None
+            self._loop_next_frame()
+            log(f"Loop FPS changed to {self.fps}")
         else:
             log(f"Playback FPS set to {self.fps}")
     
@@ -1076,6 +1100,150 @@ class PlaybackController:
     def is_playing(self) -> bool:
         """Check if currently playing."""
         return self.playing
+    
+    # =========================================================================
+    # NEW: LOOP MODE FUNCTIONALITY
+    # =========================================================================
+    
+    def start_loop(self, mode='continuous') -> bool:
+        """
+        Start frame loop mode.
+        
+        Args:
+            mode: 'continuous' (hold 'L') or 'single' (click button)
+        
+        Returns:
+            True if loop started, False otherwise
+        """
+        if not self.app.has_frames():
+            return False
+        
+        # Stop any existing playback
+        if self.playing:
+            self.pause()
+        
+        # Save current state
+        self.loop_home_frame = self.app.current_frame_idx
+        self.loop_mode = mode
+        self.loop_direction = 'forward'
+        self.loop_cycle_count = 0
+        
+        # Calculate bounds (clamped to valid range)
+        max_frame = self.app.image_handler.metadata.total_frames - 1
+        self.loop_min_bound = max(0, self.loop_home_frame - self.loop_range)
+        self.loop_max_bound = min(max_frame, self.loop_home_frame + self.loop_range)
+        
+        # Save view state (zoom/pan)
+        self.saved_zoom = self.app.canvas.zoom_factor
+        self.saved_pan_x = self.app.canvas.pan_x
+        self.saved_pan_y = self.app.canvas.pan_y
+        
+        # Activate loop
+        self.loop_active = True
+        self._stop_flag = False
+        
+        # Update UI
+        self.app.update_loop_indicator(True)
+        self.app.navigation.update_loop_bounds(self.loop_min_bound, self.loop_max_bound)
+        
+        # Start loop
+        self._loop_next_frame()
+        
+        log(f"Loop started: mode={mode}, home={self.loop_home_frame}, "
+            f"bounds=[{self.loop_min_bound}, {self.loop_max_bound}]")
+        
+        return True
+    
+    def stop_loop(self) -> None:
+        """Stop loop mode and return to home frame."""
+        if not self.loop_active:
+            return
+        
+        # Cancel timer
+        if self.playback_timer:
+            self.app.root.after_cancel(self.playback_timer)
+            self.playback_timer = None
+        
+        self.loop_active = False
+        self._stop_flag = True
+        
+        # Return to home frame
+        self.app.set_current_frame(self.loop_home_frame)
+        
+        # Restore view state (zoom/pan)
+        if self.saved_zoom is not None:
+            self.app.canvas.zoom_factor = self.saved_zoom
+            self.app.canvas.pan_x = self.saved_pan_x
+            self.app.canvas.pan_y = self.saved_pan_y
+            self.app.schedule_display_update()
+        
+        # Update UI
+        self.app.update_loop_indicator(False)
+        self.app.navigation.clear_loop_bounds()
+        
+        log(f"Loop stopped, returned to frame {self.loop_home_frame}")
+    
+    def _loop_next_frame(self) -> None:
+        """Execute next step in loop sequence."""
+        if not self.loop_active or self._stop_flag:
+            return
+        
+        current_idx = self.app.current_frame_idx
+        
+        # State machine: FORWARD → BACKWARD → RETURN → (repeat or stop)
+        
+        if self.loop_direction == 'forward':
+            # Moving forward toward max bound
+            if current_idx >= self.loop_max_bound:
+                # Reached max, switch to backward
+                self.loop_direction = 'backward'
+                next_idx = current_idx - 1
+            else:
+                next_idx = current_idx + 1
+        
+        elif self.loop_direction == 'backward':
+            # Moving backward toward min bound
+            if current_idx <= self.loop_min_bound:
+                # Reached min, switch to return
+                self.loop_direction = 'return'
+                next_idx = current_idx + 1
+            else:
+                next_idx = current_idx - 1
+        
+        elif self.loop_direction == 'return':
+            # Returning to home
+            if current_idx >= self.loop_home_frame:
+                # Reached home, cycle complete
+                self.loop_cycle_count += 1
+                
+                # Check if single-cycle mode
+                if self.loop_mode == 'single':
+                    # Single cycle done, stop
+                    self.stop_loop()
+                    return
+                else:
+                    # Continuous mode, restart
+                    self.loop_direction = 'forward'
+                    next_idx = current_idx + 1
+            else:
+                next_idx = current_idx + 1
+        
+        # Move to next frame
+        self.app.set_current_frame(next_idx)
+        
+        # Schedule next loop step
+        delay_ms = int(1000 / self.fps)
+        self.playback_timer = self.app.root.after(delay_ms, self._loop_next_frame)
+    
+    def is_looping(self) -> bool:
+        """Check if currently in loop mode."""
+        return self.loop_active
+    
+    def set_loop_range(self, range_value: int) -> None:
+        """Set loop range (number of frames forward/backward)."""
+        self.loop_range = max(1, min(range_value, 1000))
+    
+
 
 # =============================================================================
 # TIF HANDLER
@@ -2166,6 +2334,8 @@ class OptimizedCanvas(ttk.Frame):
         try:
             if not self.app.has_frames():
                 return
+            if not self.app.has_frames():
+                return
             
             # FIXED: Check if channel was switched during drawing
             if self.drawing and self.app.active_channel_id != self._drawing_channel_id:
@@ -2546,6 +2716,8 @@ class OptimizedCanvas(ttk.Frame):
             return 0, 0
     
     def _start_pan(self, event):
+        if self.app.playback_controller.is_looping():
+            return
         self.canvas.config(cursor="fleur")
         self.last_x, self.last_y = event.x, event.y
     
@@ -2582,6 +2754,9 @@ class OptimizedCanvas(ttk.Frame):
     def _apply_zoom(self, zoom_in: bool, mouse_x: int, mouse_y: int):
         """Apply zoom centered on mouse position."""
         try:
+            if self.app.playback_controller.is_looping():
+                return
+    
             if not self.app.has_frames():
                 return
             
@@ -2671,7 +2846,8 @@ class ToolbarManager(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
-        
+
+        # Tool indicator
         self.tool_indicator = ttk.Label(
             self,
             text="DRAW",
@@ -2680,6 +2856,16 @@ class ToolbarManager(ttk.Frame):
             width=12
         )
         self.tool_indicator.pack(side=tk.LEFT, padx=10)
+
+        # Loop mode indicator
+        self.loop_indicator = ttk.Label(
+            self,
+            text="",
+            font=("Arial", 10, "bold"),
+            foreground="#00BFFF"
+        )
+        self.loop_indicator.pack(side=tk.LEFT, padx=10)
+
         
         self.memory_label = ttk.Label(
             self,
@@ -2737,6 +2923,13 @@ class ToolbarManager(ttk.Frame):
             self.tool_indicator.config(text="ERASE ALL", foreground=Config.COLOR_ERROR)
         elif tool == ToolType.CONTOUR:
             self.tool_indicator.config(text="CONTOUR", foreground="#00BFFF")
+
+    def update_loop_indicator(self, active: bool):
+        """Update loop mode indicator."""
+        if active:
+            self.loop_indicator.config(text="⟲ LOOP MODE")
+        else:
+            self.loop_indicator.config(text="")
     
     def update_memory_display(self, memory_mb: float):
         """Update memory indicator with color coding."""
@@ -2798,6 +2991,9 @@ class NavigationPanel(ttk.Frame):
         self.slider_update_pending = None
         self.slider_update_delay_ms = 100
         
+        # Loop bounds visualization
+        self.loop_bounds_rect = None
+    
         # === LEFT SIDE: Frame controls ===
         left_frame = ttk.Frame(self)
         left_frame.pack(side=tk.LEFT, padx=5)
@@ -2851,6 +3047,39 @@ class NavigationPanel(ttk.Frame):
         )
         self.fps_spinbox.pack(side=tk.LEFT, padx=2)
         self.fps_spinbox.bind('<Return>', lambda e: self._update_fps())
+
+        # === LOOP CONTROLS ===
+        loop_controls_frame = ttk.Frame(playback_frame)
+        loop_controls_frame.pack(side=tk.LEFT, padx=10)
+        
+        # Loop button (single-cycle)
+        self.loop_button = ttk.Button(
+            loop_controls_frame,
+            text="🔄 Loop",
+            command=self.start_single_loop,
+            width=8
+        )
+        self.loop_button.pack(side=tk.LEFT, padx=2)
+        
+        # Loop range
+        range_frame = ttk.Frame(loop_controls_frame)
+        range_frame.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(range_frame, text="Range:", font=("Arial", 9)).pack(side=tk.LEFT)
+        
+        self.loop_range_var = tk.IntVar(value=40)
+        self.loop_range_spinbox = ttk.Spinbox(
+            range_frame,
+            from_=1,
+            to=500,
+            width=5,
+            textvariable=self.loop_range_var,
+            command=self._update_loop_range
+        )
+        self.loop_range_spinbox.pack(side=tk.LEFT, padx=2)
+        self.loop_range_spinbox.bind('<Return>', lambda e: self._update_loop_range())
+        
+        ttk.Label(range_frame, text="frames", font=("Arial", 9)).pack(side=tk.LEFT, padx=2)
         
         # === RIGHT SIDE: Skip and slider ===
         right_frame = ttk.Frame(self)
@@ -2964,6 +3193,63 @@ class NavigationPanel(ttk.Frame):
     def update_frame_label(self, current_idx: int, total_frames: int):
         """Update frame counter label."""
         self.frame_label.config(text=f"Frame: {current_idx + 1}/{total_frames}")
+    
+    # Loop Functions:
+
+    def start_single_loop(self):
+        """Start single-cycle loop mode."""
+        if self.app.playback_controller.start_loop(mode='single'):
+            # Update button state (optional visual feedback)
+            self.loop_button.config(state='disabled')
+            # Re-enable after loop finishes (handled by controller)
+            self.app.root.after(100, self._check_loop_finished)
+
+    def _check_loop_finished(self):
+        """Check if single-cycle loop has finished and re-enable button."""
+        if not self.app.playback_controller.is_looping():
+            self.loop_button.config(state='normal')
+        else:
+            self.app.root.after(100, self._check_loop_finished)
+
+    def _update_loop_range(self):
+        """Update loop range in controller."""
+        try:
+            range_value = self.loop_range_var.get()
+            self.app.playback_controller.set_loop_range(range_value)
+        except Exception as e:
+            debug_log(f"Error updating loop range: {e}")
+
+    def update_loop_bounds(self, min_bound: int, max_bound: int):
+        """Visualize loop bounds on frame slider."""
+        if not self.app.has_frames():
+            return
+        
+        try:
+            # Clear previous bounds
+            self.clear_loop_bounds()
+            
+            # Calculate slider positions for bounds
+            total_frames = self.app.image_handler.metadata.total_frames
+            if total_frames <= 1:
+                return
+            
+            min_pos = (min_bound / (total_frames - 1)) * 100
+            max_pos = (max_bound / (total_frames - 1)) * 100
+            
+            # Note: Tkinter Scale doesn't support visual highlights natively
+            # We'll just disable the slider during loop
+            self.frame_slider.config(state='disabled')
+            
+        except Exception as e:
+            debug_log(f"Error updating loop bounds: {e}")
+
+    def clear_loop_bounds(self):
+        """Clear loop bounds visualization."""
+        try:
+            self.frame_slider.config(state='normal')
+        except Exception as e:
+            debug_log(f"Error clearing loop bounds: {e}")
+
 
 
 # =============================================================================
@@ -4145,6 +4431,9 @@ class MATApplication:
         self.root.bind("b", lambda e: self.propagate_back())
         self.root.bind("[", lambda e: self.decrease_opacity())
         self.root.bind("]", lambda e: self.increase_opacity())
+        # Loop mode bindings
+        self.root.bind("<KeyPress-l>", self._on_loop_key_press)
+        self.root.bind("<KeyRelease-l>", self._on_loop_key_release)
     
     def start_memory_monitoring(self):
         """Start periodic memory monitoring."""
@@ -4997,6 +5286,10 @@ class MATApplication:
             self.schedule_display_update()
         except Exception as e:
             debug_log(f"Error updating opacity: {e}")
+
+    def update_loop_indicator(self, active: bool):
+        """Update loop mode indicator in toolbar."""
+        self.toolbar.update_loop_indicator(active)
     
     def increase_opacity(self):
         """Increase mask opacity by 10%."""
@@ -5360,7 +5653,20 @@ License: MIT
         
         self.root.quit()
         self.root.destroy()
+    
+    def _on_loop_key_press(self, event):
+        """Handle 'L' key press - start continuous loop."""
+        # Prevent repeat events (key held down)
+        if self.playback_controller.is_looping():
+            return
+        
+        # Start continuous loop
+        self.playback_controller.start_loop(mode='continuous')
 
+    def _on_loop_key_release(self, event):
+        """Handle 'L' key release - stop continuous loop."""
+        if self.playback_controller.is_looping():
+            self.playback_controller.stop_loop()
 
 # =============================================================================
 # MAIN ENTRY POINT
