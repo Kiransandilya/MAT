@@ -98,6 +98,7 @@ class Config:
     APP_FULL_NAME = "Multi-Channel Annotation Tool"
     APP_VERSION = "3.0"
     APP_DESCRIPTION = "Professional-grade annotation tool for large scientific image stacks"
+    
 
     # Key Features
     APP_FEATURES = [
@@ -115,6 +116,7 @@ class Config:
         "Recent sessions management for quick access",
         "Self-contained sessions include original TIF for portability"
     ]
+    APP_LATEST_UPDATE = "Dt.02-13-2026: Fixed: Window close now triggers safe shutdown with auto-save"
 
     # Performance settings
     MAX_DISPLAY_SIZE = int(os.getenv('MAT_MAX_DISPLAY_SIZE', '1536'))
@@ -3916,6 +3918,15 @@ class WelcomeDialog:
             font=("Arial", 10)
         )
         version_label.pack()
+
+        # Latest update info line
+        update_label = ttk.Label(
+            title_frame,
+            text=f"Latest: {Config.APP_LATEST_UPDATE}",
+            font=("Arial", 9, "italic"),
+            foreground="#888888"
+        )
+        update_label.pack(pady=(3, 0))
         
         # Get Started section
         action_frame = ttk.LabelFrame(main_frame, text="Get Started", padding=15)
@@ -5763,6 +5774,9 @@ def main():
         
         # Create application
         app = MATApplication(root)
+
+        #Tk - connecting UI 'X' close button with quit_application function
+        root.protocol("WM_DELETE_WINDOW", app.quit_application)
         
         # Show welcome dialog
         welcome = WelcomeDialog(root, app.recent_sessions)
