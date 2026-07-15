@@ -42,6 +42,9 @@ import warnings
 import json
 import pickle
 import shutil
+import platform
+import uuid
+import subprocess
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any, Union
 from dataclasses import dataclass, field
@@ -79,6 +82,298 @@ except ImportError:
 # Suppress warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+
+# =============================================================================
+# PLATFORM DETECTION AND COMPATIBILITY
+# =============================================================================
+
+class PlatformInfo:
+    """
+    Detects the host platform once at import time and provides
+    platform-aware helpers so the rest of the code never needs
+    OS-specific branches scattered around.
+
+    Handles the Mac-specific traps that broke MAT on M1/M2/M3:
+    - Apple Silicon vs Intel vs Rosetta detection
+    - Tk file dialog filetype patterns (';' separators are Windows-only)
+    - Mouse wheel delta scaling (macOS reports small deltas, not ±120)
+    """
+
+    SYSTEM = platform.system()                # 'Darwin', 'Windows', 'Linux'
+    IS_MACOS = SYSTEM == 'Darwin'
+    IS_WINDOWS = SYSTEM == 'Windows'
+    IS_LINUX = SYSTEM == 'Linux'
+    MACHINE = platform.machine()              # 'arm64', 'x86_64', 'AMD64', ...
+    PYTHON_VERSION = platform.python_version()
+
+    # Apple Silicon: either running natively (arm64) or under Rosetta 2
+    # (reports x86_64 but sysctl.proc_translated == 1)
+    IS_ROSETTA = False
+    if IS_MACOS and MACHINE == 'x86_64':
+        try:
+            IS_ROSETTA = subprocess.run(
+                ['sysctl', '-n', 'sysctl.proc_translated'],
+                capture_output=True, text=True, timeout=2
+            ).stdout.strip() == '1'
+        except Exception:
+            IS_ROSETTA = False
+
+    IS_APPLE_SILICON = IS_MACOS and (MACHINE == 'arm64' or IS_ROSETTA)
+
+    @classmethod
+    def describe(cls) -> str:
+        """Human-readable one-line platform summary."""
+        if cls.IS_MACOS:
+            chip = 'Apple Silicon (native arm64)' if cls.MACHINE == 'arm64' else (
+                'Apple Silicon (x86_64 under Rosetta 2)' if cls.IS_ROSETTA else 'Intel x86_64')
+            os_name = f"macOS {platform.mac_ver()[0]} — {chip}"
+        elif cls.IS_WINDOWS:
+            os_name = f"Windows {platform.release()} — {cls.MACHINE}"
+        else:
+            os_name = f"{cls.SYSTEM} — {cls.MACHINE}"
+        return f"{os_name} | Python {cls.PYTHON_VERSION}"
+
+    @staticmethod
+    def tif_filetypes():
+        """
+        Cross-platform Tk filetypes for TIF selection.
+
+        A tuple of patterns works on every Tk backend. The old
+        '*.tif;*.tiff' string only works on Windows — on macOS the
+        native dialog treats it as one literal pattern, making TIF
+        files unselectable (greyed out).
+        """
+        return [("TIF files", ("*.tif", "*.tiff")), ("All files", "*")]
+
+    @staticmethod
+    def wheel_scroll_units(event) -> int:
+        """
+        Normalize a <MouseWheel> event delta to Tk scroll units.
+
+        Windows/Linux-Tk report multiples of ±120; macOS reports the
+        raw (small) scroll amount, so dividing by 120 always yields 0
+        and scrolling silently does nothing on Mac trackpads/mice.
+        """
+        delta = getattr(event, 'delta', 0)
+        if delta == 0:
+            return 0
+        if PlatformInfo.IS_MACOS:
+            return -1 if delta > 0 else 1
+        return int(-1 * (delta / 120))
+
+
+# =============================================================================
+# STARTUP DIAGNOSTICS (SMOKE TESTS)
+# =============================================================================
+
+class StartupDiagnostics:
+    """
+    Runs quick functional smoke tests of every library MAT depends on.
+
+    Each test actually exercises the library (not just imports it), so a
+    broken native wheel (the usual failure mode on Apple Silicon) is
+    caught at startup instead of mid-annotation. Results are:
+      OK       — works
+      FALLBACK — unavailable, but MAT has a built-in fallback
+      FAIL     — broken and required
+    """
+
+    LOG_FILE = 'mat_diagnostics.log'
+
+    def __init__(self):
+        self.results: List[Dict[str, str]] = []
+        self.ran_at: str = ""
+
+    def _record(self, component: str, status: str, detail: str = ""):
+        self.results.append({'component': component, 'status': status, 'detail': detail})
+
+    def run(self, tk_root=None) -> 'StartupDiagnostics':
+        """Run all smoke tests. Pass the Tk root to also test ImageTk rendering."""
+        self.results = []
+        self.ran_at = datetime.datetime.now().isoformat(timespec='seconds')
+
+        self._record('Platform', 'OK', PlatformInfo.describe())
+        if PlatformInfo.IS_ROSETTA:
+            self._record('Rosetta', 'FALLBACK',
+                         'Running x86_64 Python via Rosetta 2 on Apple Silicon. Works, but a '
+                         'native arm64 Python (e.g. python.org universal2 installer) is faster.')
+
+        self._test_numpy()
+        self._test_opencv_core()
+        self._test_optical_flow()
+        self._test_pillow(tk_root)
+        self._test_tkinter(tk_root)
+        self._test_scipy()
+        self._test_psutil()
+        self._test_file_io()
+        self._test_pickle_roundtrip()
+
+        return self
+
+    def _test_numpy(self):
+        try:
+            arr = np.zeros((16, 16), dtype=np.uint8)
+            arr[4:8, 4:8] = 255
+            _ = arr.astype(np.float32) / 255.0
+            _ = np.mgrid[0:4, 0:4]
+            _ = int(np.sum(arr > 0))
+            self._record('numpy', 'OK', f"v{np.__version__}")
+        except Exception as e:
+            self._record('numpy', 'FAIL', f"{type(e).__name__}: {e}")
+
+    def _test_opencv_core(self):
+        try:
+            img = np.random.randint(0, 255, (32, 32), dtype=np.uint8)
+            rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            _ = cv2.resize(rgb, (16, 16), interpolation=cv2.INTER_LINEAR)
+            ok, _ = cv2.imencode('.png', rgb)
+            if not ok:
+                raise RuntimeError("imencode returned False")
+            self._record('opencv (core)', 'OK', f"v{cv2.__version__}")
+        except Exception as e:
+            self._record('opencv (core)', 'FAIL', f"{type(e).__name__}: {e}")
+
+    def _test_optical_flow(self):
+        # Farneback ships with opencv-python and is the propagation fallback
+        try:
+            f1 = np.random.randint(0, 255, (32, 32), dtype=np.uint8)
+            f2 = np.roll(f1, 1, axis=0)
+            flow = cv2.calcOpticalFlowFarneback(
+                f1, f2, None, pyr_scale=0.5, levels=1, winsize=9,
+                iterations=1, poly_n=5, poly_sigma=1.2, flags=0)
+            if flow.shape != (32, 32, 2):
+                raise RuntimeError(f"unexpected flow shape {flow.shape}")
+            self._record('optical flow (Farneback)', 'OK', 'mask propagation available')
+        except Exception as e:
+            self._record('optical flow (Farneback)', 'FAIL', f"{type(e).__name__}: {e}")
+
+        # DualTVL1 needs opencv-contrib-python; MAT falls back to Farneback
+        try:
+            cv2.optflow.DualTVL1OpticalFlow_create()
+            self._record('optical flow (DualTVL1)', 'OK', 'opencv-contrib available')
+        except Exception:
+            self._record('optical flow (DualTVL1)', 'FALLBACK',
+                         'opencv-contrib-python not installed — using Farneback (this is fine)')
+
+    def _test_pillow(self, tk_root):
+        try:
+            from PIL import __version__ as pil_version
+            img = Image.fromarray(np.zeros((16, 16, 3), dtype=np.uint8))
+            _ = img.resize((8, 8))
+            detail = f"v{pil_version}"
+            if tk_root is not None:
+                photo = ImageTk.PhotoImage(img)   # crashes here if Tk/Pillow wheels mismatch
+                del photo
+                detail += ", ImageTk rendering OK"
+            self._record('Pillow', 'OK', detail)
+        except Exception as e:
+            self._record('Pillow', 'FAIL', f"{type(e).__name__}: {e}")
+
+    def _test_tkinter(self, tk_root):
+        try:
+            if tk_root is not None:
+                patchlevel = tk_root.tk.call('info', 'patchlevel')
+            else:
+                patchlevel = tk.TkVersion
+            detail = f"Tcl/Tk {patchlevel}"
+            if PlatformInfo.IS_MACOS:
+                try:
+                    parts = [int(p) for p in str(patchlevel).split('.')[:3]]
+                    if parts[:2] == [8, 6] and len(parts) > 2 and parts[2] < 12:
+                        self._record('tkinter', 'FALLBACK',
+                                     f"{detail} — old Tk builds are unstable on modern macOS; "
+                                     "install Python from python.org (bundles Tk 8.6.12+)")
+                        return
+                except (ValueError, IndexError):
+                    pass
+            self._record('tkinter', 'OK', detail)
+        except Exception as e:
+            self._record('tkinter', 'FAIL', f"{type(e).__name__}: {e}")
+
+    def _test_scipy(self):
+        if not SCIPY_AVAILABLE:
+            self._record('scipy', 'FALLBACK', 'not installed — temporal smoothing uses raw data')
+            return
+        try:
+            data = np.sin(np.linspace(0, 4, 20))
+            smoothed = savgol_filter(data, window_length=5, polyorder=2)
+            if smoothed.shape != data.shape:
+                raise RuntimeError("savgol_filter shape mismatch")
+            self._record('scipy', 'OK', 'savgol_filter working')
+        except Exception as e:
+            self._record('scipy', 'FALLBACK', f"savgol broken ({type(e).__name__}: {e}) — using raw data")
+
+    def _test_psutil(self):
+        if not PSUTIL_AVAILABLE:
+            self._record('psutil', 'FALLBACK', 'not installed — memory monitoring disabled')
+            return
+        try:
+            mem_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+            self._record('psutil', 'OK', f"process memory {mem_mb:.0f} MB")
+        except Exception as e:
+            self._record('psutil', 'FALLBACK', f"{type(e).__name__}: {e} — memory monitoring disabled")
+
+    def _test_file_io(self):
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                f.write("mat smoke test")
+                tmp_path = Path(f.name)
+            content = tmp_path.read_text()
+            tmp_path.unlink()
+            if content != "mat smoke test":
+                raise RuntimeError("read-back mismatch")
+            self._record('file I/O', 'OK', 'temp write/read working')
+        except Exception as e:
+            self._record('file I/O', 'FAIL', f"{type(e).__name__}: {e}")
+
+    def _test_pickle_roundtrip(self):
+        try:
+            payload = {
+                'mask': np.random.randint(0, 2, (8, 8), dtype=np.uint8),
+                'path': str(Path.home()),
+                'time': datetime.datetime.now(),
+            }
+            blob = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+            restored = pickle.loads(blob)
+            if not np.array_equal(restored['mask'], payload['mask']):
+                raise RuntimeError("mask round-trip mismatch")
+            self._record('session pickle', 'OK', 'save/load round-trip working')
+        except Exception as e:
+            self._record('session pickle', 'FAIL', f"{type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    @property
+    def failures(self) -> List[Dict[str, str]]:
+        return [r for r in self.results if r['status'] == 'FAIL']
+
+    @property
+    def fallbacks(self) -> List[Dict[str, str]]:
+        return [r for r in self.results if r['status'] == 'FALLBACK']
+
+    def summary_text(self) -> str:
+        icons = {'OK': '✅', 'FALLBACK': '⚠️', 'FAIL': '❌'}
+        lines = [f"MAT Startup Diagnostics — {self.ran_at}", ""]
+        for r in self.results:
+            lines.append(f"{icons.get(r['status'], '?')} {r['component']:28s} {r['status']:8s} {r['detail']}")
+        lines.append("")
+        if self.failures:
+            lines.append(f"{len(self.failures)} component(s) FAILED — see above for details.")
+        elif self.fallbacks:
+            lines.append("All required components working (some optional features use fallbacks).")
+        else:
+            lines.append("All components fully operational.")
+        return "\n".join(lines)
+
+    def save_log(self, directory: Optional[Path] = None) -> Optional[Path]:
+        try:
+            log_path = Path(directory or Path.cwd()) / self.LOG_FILE
+            with open(log_path, 'w', encoding='utf-8') as f:
+                f.write(self.summary_text() + "\n")
+            return log_path
+        except Exception as e:
+            log(f"Could not write diagnostics log: {e}", 'WARNING')
+            return None
 
 
 # =============================================================================
@@ -1685,6 +1980,160 @@ class PropagationEngine:
 
 
 # =============================================================================
+# USER PROFILE (ANNOTATOR IDENTITY)
+# =============================================================================
+
+class UserProfileManager:
+    """
+    Persistent per-machine annotator identity.
+
+    On first launch, MAT reads the machine's MAC address and asks the user
+    for their name. The profile is stored in the user's home directory
+    (survives reinstalls and works regardless of where MAT is run from).
+    Every session save embeds this identity, so shared session folders
+    always record who annotated them.
+    """
+
+    @staticmethod
+    def profile_dir() -> Path:
+        override = os.getenv('MAT_PROFILE_DIR')
+        return Path(override) if override else Path.home() / '.mat_annotation_tool'
+
+    @classmethod
+    def profile_file(cls) -> Path:
+        return cls.profile_dir() / 'user_profile.json'
+
+    @staticmethod
+    def get_mac_id() -> str:
+        """Machine MAC address as AA:BB:CC:DD:EE:FF."""
+        node = uuid.getnode()
+        mac = f"{node:012X}"
+        return ":".join(mac[i:i + 2] for i in range(0, 12, 2))
+
+    @classmethod
+    def load(cls) -> Optional[Dict[str, Any]]:
+        try:
+            pf = cls.profile_file()
+            if not pf.exists():
+                return None
+            with open(pf, 'r', encoding='utf-8') as f:
+                profile = json.load(f)
+            if not profile.get('name'):
+                return None
+            return profile
+        except Exception as e:
+            log(f"Could not read user profile: {e}", 'WARNING')
+            return None
+
+    @classmethod
+    def save(cls, name: str) -> Dict[str, Any]:
+        profile = {
+            'name': name.strip(),
+            'mac_id': cls.get_mac_id(),
+            'hostname': platform.node(),
+            'os': PlatformInfo.describe(),
+            'registered_at': datetime.datetime.now().isoformat(timespec='seconds'),
+        }
+        try:
+            cls.profile_dir().mkdir(parents=True, exist_ok=True)
+            with open(cls.profile_file(), 'w', encoding='utf-8') as f:
+                json.dump(profile, f, indent=2)
+            log(f"User profile saved for '{profile['name']}' ({profile['mac_id']})")
+        except Exception as e:
+            log(f"Could not save user profile: {e}", 'WARNING')
+        return profile
+
+    @classmethod
+    def ensure_profile(cls, parent) -> Dict[str, Any]:
+        """
+        Return the stored profile, prompting for a name on first run.
+
+        Never blocks app usage: if the dialog is cancelled, the OS login
+        name is used so saved data is still traceable to a machine.
+        """
+        profile = cls.load()
+        if profile:
+            return profile
+
+        suggested = os.getenv('USER') or os.getenv('USERNAME') or 'Unknown'
+        name = cls._prompt_name(parent, suggested)
+        return cls.save(name or suggested)
+
+    @staticmethod
+    def _prompt_name(parent, suggested: str) -> Optional[str]:
+        """First-run registration dialog. Returns entered name or None."""
+        try:
+            dialog = tk.Toplevel(parent)
+            dialog.title("Welcome — First Time Setup")
+            dialog.configure(bg=Config.COLOR_BG_PRIMARY)
+            dialog.transient(parent)
+            dialog.grab_set()
+            dialog.resizable(False, False)
+
+            frame = ttk.Frame(dialog, padding=25)
+            frame.pack(fill=tk.BOTH, expand=True)
+
+            ttk.Label(frame, text="Welcome to MAT!",
+                      font=("Arial", 14, "bold")).pack(pady=(0, 8))
+            ttk.Label(frame, justify=tk.LEFT, font=("Arial", 10), text=(
+                "This looks like the first time MAT runs on this computer.\n"
+                "Please enter your name — it is stored with every session\n"
+                "you save, so shared annotation data can be traced back\n"
+                "to the person who created it.")).pack(pady=(0, 12))
+            ttk.Label(frame, font=("Arial", 9), foreground="#888888",
+                      text=f"Machine ID (MAC): {UserProfileManager.get_mac_id()}").pack(pady=(0, 12))
+
+            name_var = tk.StringVar(value=suggested)
+            entry = ttk.Entry(frame, textvariable=name_var, width=34, font=("Arial", 11))
+            entry.pack(pady=(0, 15))
+            entry.select_range(0, tk.END)
+            entry.focus_set()
+
+            result = [None]
+
+            def on_ok():
+                value = name_var.get().strip()
+                if not value:
+                    messagebox.showwarning("Name Required",
+                                           "Please enter your name.", parent=dialog)
+                    return
+                result[0] = value
+                dialog.destroy()
+
+            ttk.Button(frame, text="Continue", command=on_ok, width=20).pack()
+            dialog.bind("<Return>", lambda e: on_ok())
+            dialog.protocol("WM_DELETE_WINDOW", on_ok)
+
+            dialog.update_idletasks()
+            w, h = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
+            x = (dialog.winfo_screenwidth() - w) // 2
+            y = (dialog.winfo_screenheight() - h) // 2
+            dialog.geometry(f"+{x}+{y}")
+
+            dialog.wait_window()
+            return result[0]
+        except Exception as e:
+            log(f"Error showing registration dialog: {e}", 'WARNING')
+            return None
+
+
+# Populated in main(); embedded into every session save
+CURRENT_USER_PROFILE: Dict[str, Any] = {}
+
+
+def get_current_annotator() -> Dict[str, Any]:
+    """Identity of the current user for embedding in saved sessions."""
+    if CURRENT_USER_PROFILE:
+        return {k: CURRENT_USER_PROFILE.get(k) for k in ('name', 'mac_id', 'hostname', 'os')}
+    return {
+        'name': os.getenv('USER') or os.getenv('USERNAME') or 'Unknown',
+        'mac_id': UserProfileManager.get_mac_id(),
+        'hostname': platform.node(),
+        'os': PlatformInfo.describe(),
+    }
+
+
+# =============================================================================
 # RECENT SESSIONS MANAGER
 # =============================================================================
 
@@ -1890,6 +2339,96 @@ class ProgressDialog:
 
 
 # =============================================================================
+# CROSS-PLATFORM SESSION COMPATIBILITY
+# =============================================================================
+
+class _CompatUnpickler(pickle.Unpickler):
+    """
+    Unpickler that makes session.dat files portable across machines.
+
+    Fixes the two failures that broke loading a colleague's session:
+    - pathlib: a session saved on Windows contains WindowsPath objects,
+      which raise NotImplementedError when unpickled on macOS/Linux
+      (and vice versa). All Path flavors are mapped to the current
+      OS's concrete Path class.
+    - numpy: numpy 2.x pickles arrays referencing 'numpy._core', which
+      does not exist in numpy 1.x installs ('numpy.core'), and vice
+      versa. Both module names are tried.
+    """
+
+    _PATH_CLASSES = {'WindowsPath', 'PosixPath', 'PureWindowsPath',
+                     'PurePosixPath', 'Path', 'PurePath'}
+    _PATHLIB_MODULES = {'pathlib', 'pathlib._local'}
+
+    def find_class(self, module, name):
+        if name in self._PATH_CLASSES and module in self._PATHLIB_MODULES:
+            return Path
+        if module.split('.')[0] == 'numpy':
+            try:
+                return super().find_class(module, name)
+            except (ModuleNotFoundError, AttributeError):
+                if module.startswith('numpy._core'):
+                    alt = module.replace('numpy._core', 'numpy.core', 1)
+                elif module.startswith('numpy.core'):
+                    alt = module.replace('numpy.core', 'numpy._core', 1)
+                else:
+                    raise
+                return super().find_class(alt, name)
+        return super().find_class(module, name)
+
+
+def safe_pickle_load(file_path: Path) -> Any:
+    """Load a pickle file with cross-platform compatibility shims."""
+    with open(file_path, 'rb') as f:
+        return _CompatUnpickler(f).load()
+
+
+def find_session_dirs(folder: Path, max_depth: int = 2) -> List[Path]:
+    """
+    Find every session folder related to what the user selected.
+
+    Users sharing data often hand over a zip: after extraction the
+    session.dat may live one or two levels below the selected folder,
+    or the user may click INTO the session (e.g. into Masks/). This
+    checks the folder itself, its subfolders (up to max_depth), and
+    its parent folders. macOS zip artifacts (__MACOSX, hidden dirs)
+    are skipped.
+    """
+    found: List[Path] = []
+    seen = set()
+
+    def check(d: Path):
+        key = str(d)
+        if key in seen:
+            return
+        seen.add(key)
+        try:
+            if (d / Config.SESSION_LOG_BINARY).is_file():
+                found.append(d)
+        except OSError:
+            pass
+
+    def walk(d: Path, depth: int):
+        if depth > max_depth:
+            return
+        try:
+            for child in sorted(d.iterdir()):
+                if (child.is_dir() and not child.name.startswith('.')
+                        and child.name != '__MACOSX'):
+                    check(child)
+                    walk(child, depth + 1)
+        except OSError:
+            pass
+
+    check(folder)
+    walk(folder, 1)
+    for parent in list(folder.parents)[:2]:
+        check(parent)
+
+    return found
+
+
+# =============================================================================
 # SESSION MANAGER
 # =============================================================================
 
@@ -1958,20 +2497,22 @@ class SessionManager:
                 log(f"Session file not found: {session_file}", 'ERROR')
                 return None
             
-            # Load with migration support
+            # Load with migration support (compat unpickler handles
+            # sessions saved on other OSes / numpy versions)
             try:
-                with open(session_file, 'rb') as f:
-                    data = pickle.load(f)
-                    # Handle old format with wrapper dict
-                    if isinstance(data, dict) and 'session_state' in data:
-                        session_state = data['session_state']
-                    else:
-                        session_state = data
+                data = safe_pickle_load(session_file)
+                # Handle old format with wrapper dict
+                if isinstance(data, dict) and 'session_state' in data:
+                    session_state = data['session_state']
+                    if isinstance(data.get('annotator'), dict):
+                        log(f"Session created by: {data['annotator'].get('name', 'Unknown')} "
+                            f"({data['annotator'].get('mac_id', '?')})")
+                else:
+                    session_state = data
             except TypeError as e:
                 if 'unexpected keyword argument' in str(e):
                     log("Detected old session format, attempting migration...", 'WARNING')
-                    with open(session_file, 'rb') as f:
-                        old_data = pickle.load(f)
+                    old_data = safe_pickle_load(session_file)
                     
                     if hasattr(old_data, '__dict__'):
                         state_dict = old_data.__dict__.copy()
@@ -2012,6 +2553,7 @@ class SessionManager:
             'version': VERSION,
             'session_state': session_state,
             'save_time': datetime.datetime.now(),
+            'annotator': get_current_annotator(),
         }
         
         with open(path, 'wb') as f:
@@ -2044,8 +2586,26 @@ class SessionManager:
     
     def _save_json(self, session_state: SessionState, path: Path):
         """Save metadata to JSON."""
+        # Annotator identity + contributor history, so shared session
+        # folders record every person (name + MAC) who worked on them
+        annotator = get_current_annotator()
+        contributors: List[Dict[str, Any]] = []
+        try:
+            if path.exists():
+                with open(path, 'r') as f:
+                    contributors = json.load(f).get('contributors', [])
+        except Exception:
+            contributors = []
+        if not any(c.get('mac_id') == annotator.get('mac_id') for c in contributors):
+            contributors.append({
+                **annotator,
+                'first_contributed': datetime.datetime.now().isoformat(timespec='seconds')
+            })
+
         data = {
             'version': VERSION,
+            'annotator': annotator,
+            'contributors': contributors,
             'project_name': session_state.project_name,
             'created_at': session_state.created_at,
             'last_saved': session_state.last_saved,
@@ -3416,7 +3976,9 @@ class CollapsiblePanel(ttk.Frame):
             # Only scroll if mouse is over the canvas
             widget = event.widget
             if widget == self.canvas or str(widget).startswith(str(self.canvas)):
-                self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+                units = PlatformInfo.wheel_scroll_units(event)
+                if units:
+                    self.canvas.yview_scroll(units, "units")
         
         # FIXED: Bind only to this canvas, not globally
         self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", on_mousewheel))
@@ -3919,6 +4481,14 @@ class WelcomeDialog:
         )
         version_label.pack()
 
+        if CURRENT_USER_PROFILE.get('name'):
+            ttk.Label(
+                title_frame,
+                text=f"Annotator: {CURRENT_USER_PROFILE['name']}",
+                font=("Arial", 9),
+                foreground=Config.COLOR_ACCENT
+            ).pack(pady=(2, 0))
+
         # Latest update info line
         update_label = ttk.Label(
             title_frame,
@@ -4018,7 +4588,7 @@ class WelcomeDialog:
         """Open file selection dialog."""
         file_path = filedialog.askopenfilename(
             title="Select TIF File",
-            filetypes=[("TIF files", "*.tif;*.tiff"), ("All files", "*.*")],
+            filetypes=PlatformInfo.tif_filetypes(),
             parent=self.dialog
         )
         
@@ -4051,26 +4621,18 @@ class WelcomeDialog:
             return
         
         folder_path = Path(folder)
-        session_dat = folder_path / Config.SESSION_LOG_BINARY
-        
+
         # Check if selected folder contains session.dat
-        if session_dat.exists():
+        if (folder_path / Config.SESSION_LOG_BINARY).exists():
             self.selected_file = folder
             self.result = 'session_selected'
             self.dialog.destroy()
             return
-        
-        # If not, check immediate subfolders for session folders
-        session_folders = []
-        try:
-            for subfolder in folder_path.iterdir():
-                if subfolder.is_dir():
-                    sub_session_dat = subfolder / Config.SESSION_LOG_BINARY
-                    if sub_session_dat.exists():
-                        session_folders.append(subfolder)
-        except Exception as e:
-            log(f"Error scanning subfolders: {e}", 'WARNING')
-        
+
+        # Robust search: subfolders (up to 2 levels deep, e.g. extracted
+        # zip shares) and parent folders (user clicked inside the session)
+        session_folders = find_session_dirs(folder_path)
+
         if len(session_folders) == 1:
             # Found exactly one session folder
             if messagebox.askyesno(
@@ -4253,6 +4815,9 @@ class MATApplication:
         self.project_dir: Optional[Path] = None
         self.original_tif_path: Optional[Path] = None
 
+        # Startup smoke-test results (set in main())
+        self.diagnostics: Optional[StartupDiagnostics] = None
+
         # Setup UI
         self.setup_theme()
         self.setup_ui()
@@ -4364,7 +4929,9 @@ class MATApplication:
         
         # Bind mousewheel
         def on_mousewheel(event):
-            controls_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            units = PlatformInfo.wheel_scroll_units(event)
+            if units:
+                controls_canvas.yview_scroll(units, "units")
         
         controls_canvas.bind("<Enter>", lambda e: controls_canvas.bind_all("<MouseWheel>", on_mousewheel))
         controls_canvas.bind("<Leave>", lambda e: controls_canvas.unbind_all("<MouseWheel>"))
@@ -4495,6 +5062,7 @@ class MATApplication:
         
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
+        help_menu.add_command(label="System Diagnostics...", command=self.show_diagnostics)
         help_menu.add_command(label="About", command=self.show_about)
     
     def setup_bindings(self):
@@ -4704,7 +5272,7 @@ class MATApplication:
         try:
             file_path = filedialog.askopenfilename(
                 title="Open TIF File",
-                filetypes=[("TIF files", "*.tif;*.tiff"), ("All files", "*.*")]
+                filetypes=PlatformInfo.tif_filetypes()
             )
             
             if not file_path:
@@ -4980,17 +5548,69 @@ class MATApplication:
         folder = filedialog.askdirectory(title="Select Session Folder")
         if not folder:
             return
-        
+
         session_dir = Path(folder)
-        
+
         if not (session_dir / Config.SESSION_LOG_BINARY).exists():
-            messagebox.showerror(
-                "Invalid Session",
-                f"Not a valid session folder:\n{Config.SESSION_LOG_BINARY} not found"
-            )
-            return
-        
+            # Same robust search as the welcome dialog: look in
+            # subfolders and parent folders before giving up
+            candidates = find_session_dirs(session_dir)
+
+            if len(candidates) == 1:
+                if not messagebox.askyesno(
+                    "Session Found",
+                    f"Found session folder:\n{candidates[0].name}\n\nLoad this session?",
+                    parent=self.root
+                ):
+                    return
+                session_dir = candidates[0]
+            elif len(candidates) > 1:
+                chosen = self._choose_session_folder(candidates)
+                if not chosen:
+                    return
+                session_dir = chosen
+            else:
+                messagebox.showerror(
+                    "Invalid Session",
+                    f"No session found in or around:\n{session_dir}\n\n"
+                    f"A session folder contains a '{Config.SESSION_LOG_BINARY}' file.",
+                    parent=self.root
+                )
+                return
+
         self.load_session_with_fallback(session_dir)
+
+    def _choose_session_folder(self, session_folders: List[Path]) -> Optional[Path]:
+        """Let the user pick one of several discovered session folders."""
+        choice_dialog = tk.Toplevel(self.root)
+        choice_dialog.title("Select Session")
+        choice_dialog.geometry("450x300")
+        choice_dialog.transient(self.root)
+        choice_dialog.grab_set()
+
+        ttk.Label(
+            choice_dialog,
+            text=f"Found {len(session_folders)} session folders. Select one:",
+            font=("Arial", 10)
+        ).pack(pady=10)
+
+        listbox = tk.Listbox(choice_dialog, height=10)
+        listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        for sf in session_folders:
+            listbox.insert(tk.END, sf.name)
+
+        selected = [None]
+
+        def on_select():
+            selection = listbox.curselection()
+            if selection:
+                selected[0] = session_folders[selection[0]]
+                choice_dialog.destroy()
+
+        ttk.Button(choice_dialog, text="Load Selected", command=on_select).pack(pady=5)
+        choice_dialog.wait_window()
+        return selected[0]
     
     def load_session_with_fallback(self, session_dir: Path) -> bool:
         """Load session with automatic TIF loading and fallback."""
@@ -5086,7 +5706,7 @@ class MATApplication:
                 
                 tif_path = filedialog.askopenfilename(
                     title="Locate Original TIF File",
-                    filetypes=[("TIF files", "*.tif;*.tiff"), ("All files", "*.*")],
+                    filetypes=PlatformInfo.tif_filetypes(),
                     parent=self.root
                 )
                 
@@ -5689,6 +6309,29 @@ class MATApplication:
 
 
 
+    def show_diagnostics(self):
+        """Re-run startup smoke tests and display the report."""
+        diagnostics = StartupDiagnostics().run(tk_root=self.root)
+        diagnostics.save_log()
+        self.diagnostics = diagnostics
+
+        win = tk.Toplevel(self.root)
+        win.title("System Diagnostics")
+        win.geometry("780x460")
+        win.configure(bg=Config.COLOR_BG_PRIMARY)
+        win.transient(self.root)
+
+        text = tk.Text(
+            win, wrap=tk.NONE,
+            bg=Config.COLOR_BG_SECONDARY, fg=Config.COLOR_FG_PRIMARY,
+            font=("Courier", 11), padx=10, pady=10
+        )
+        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        text.insert("1.0", diagnostics.summary_text())
+        text.config(state=tk.DISABLED)
+
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
+
     def show_about(self):
         """Show about dialog."""
         about_text = f"""
@@ -5763,17 +6406,41 @@ License: MIT
 
 def main():
     """Main application entry point."""
+    global CURRENT_USER_PROFILE
     try:
         log(f"Starting {Config.APP_NAME} v{VERSION}")
-        
+        log(f"Platform: {PlatformInfo.describe()}")
+
         # Create root window
         root = tk.Tk()
         root.title(f"{Config.APP_NAME} v{VERSION}")
         root.geometry(f"{Config.DEFAULT_WINDOW_WIDTH}x{Config.DEFAULT_WINDOW_HEIGHT}")
         root.minsize(Config.MIN_WINDOW_WIDTH, Config.MIN_WINDOW_HEIGHT)
-        
+
+        # Startup smoke tests: verify every library actually works on
+        # this machine before the user starts annotating
+        diagnostics = StartupDiagnostics().run(tk_root=root)
+        diagnostics.save_log()
+        for line in diagnostics.summary_text().splitlines():
+            log(line)
+        if diagnostics.failures:
+            messagebox.showwarning(
+                "Startup Diagnostics",
+                "Some components failed their startup checks:\n\n"
+                + "\n".join(f"• {r['component']}: {r['detail']}" for r in diagnostics.failures)
+                + "\n\nMAT will try to continue, but related features may not work.\n"
+                f"Full report saved to: {StartupDiagnostics.LOG_FILE}",
+                parent=root
+            )
+
+        # First-run registration: annotator name + machine MAC id,
+        # embedded in every saved session for traceability
+        CURRENT_USER_PROFILE = UserProfileManager.ensure_profile(root)
+        log(f"Annotator: {CURRENT_USER_PROFILE.get('name')} ({CURRENT_USER_PROFILE.get('mac_id')})")
+
         # Create application
         app = MATApplication(root)
+        app.diagnostics = diagnostics
 
         #Tk - connecting UI 'X' close button with quit_application function
         root.protocol("WM_DELETE_WINDOW", app.quit_application)

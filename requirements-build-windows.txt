@@ -1,0 +1,9 @@
+# Windows .exe packaging dependencies only — NOT needed to run MAT.
+# Used with PyInstaller to build a standalone Windows executable.
+
+-r requirements.txt
+pyinstaller>=6.12
+pyinstaller-hooks-contrib>=2025.1
+pefile>=2023.2.7
+pywin32-ctypes>=0.2.3
+altgraph>=0.17.4
