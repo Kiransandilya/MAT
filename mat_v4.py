@@ -1941,6 +1941,25 @@ class SessionManager:
             traceback.print_exc()
             return False
     
+    @staticmethod
+    def _pickle_load_compat(f):
+        """Load a pickle, tolerating sessions saved by other builds:
+        Python 3.13+ moved pathlib classes to pathlib._local, and the
+        modular build pickles classes under their own module names
+        (annotations, channel_manager, ...) instead of this module."""
+        class _CompatUnpickler(pickle.Unpickler):
+            def find_class(self, module, name):
+                if module == 'pathlib._local':
+                    module = 'pathlib'
+                try:
+                    return super().find_class(module, name)
+                except (ImportError, AttributeError):
+                    cls = globals().get(name)
+                    if cls is not None:
+                        return cls
+                    raise
+        return _CompatUnpickler(f).load()
+
     def load_session_from_file(self, session_dir: Path) -> Optional[SessionState]:
         """
         Load session state from file.
@@ -1961,7 +1980,7 @@ class SessionManager:
             # Load with migration support
             try:
                 with open(session_file, 'rb') as f:
-                    data = pickle.load(f)
+                    data = self._pickle_load_compat(f)
                     # Handle old format with wrapper dict
                     if isinstance(data, dict) and 'session_state' in data:
                         session_state = data['session_state']
@@ -1971,7 +1990,7 @@ class SessionManager:
                 if 'unexpected keyword argument' in str(e):
                     log("Detected old session format, attempting migration...", 'WARNING')
                     with open(session_file, 'rb') as f:
-                        old_data = pickle.load(f)
+                        old_data = self._pickle_load_compat(f)
                     
                     if hasattr(old_data, '__dict__'):
                         state_dict = old_data.__dict__.copy()
