@@ -1,22 +1,13 @@
+# MAT runtime dependencies (cross-platform: macOS Intel/Apple Silicon, Windows, Linux)
+# Install with: pip install -r requirements.txt
 
+numpy>=1.24
+opencv-python>=4.8
+pillow>=9.0
+scipy>=1.9          # optional: temporal smoothing (MAT falls back gracefully without it)
+psutil>=5.9         # optional: memory monitoring (MAT falls back gracefully without it)
 
-scipy>=1.9.0
-wheel>=0.41.0
-opencv-python>=4.8.0
-
-altgraph==0.17.4
-numpy==2.0.2
-opencv-python==4.11.0.86
-packaging==24.2
-pefile==2023.2.7
-pillow==11.1.0
-pyinstaller==6.12.0
-pyinstaller-hooks-contrib==2025.1
-pywin32-ctypes==0.2.3
-setuptools==75.8.2
-tkinterdnd2==0.4.3
-
-
-psutil>=5.9.0
-
-
+# Optional: higher-quality DualTVL1 optical flow for mask propagation.
+# Without it MAT automatically falls back to Farneback (built into opencv-python).
+# NOTE: install INSTEAD of opencv-python, not alongside it:
+# opencv-contrib-python>=4.8

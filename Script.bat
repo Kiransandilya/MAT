@@ -18,6 +18,6 @@ if exist requirements.txt (
     pip install -r requirements.txt
 )
 
-REM Run the Python script
-python m8.py
+REM Run MAT
+python mat_v4.py
 pause
